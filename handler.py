@@ -1,6 +1,5 @@
 #!/usr/bin/env python
-# Handler for RunPod Serverless Gemma 3 Image Captioning
-
+# Handler for RunPod Serverless Gemma 3
 import os
 import runpod
 import torch
@@ -13,20 +12,15 @@ from transformers import AutoProcessor, Gemma3ForConditionalGeneration, BitsAndB
 # Get model ID from environment variable with fallback to default
 MODEL_ID = os.environ.get("MODEL_ID", "google/gemma-3-4b-it")
 
-# Prompt for image captioning - modify this to change what kind of captions you get
-CAPTION_PROMPT = os.environ.get("CAPTION_PROMPT", 
-                               "Provide a short, single-line description of this image for training data.")
-
 # Maximum tokens to generate with fallback to default
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
 # =====================================
 
-# Set up Hugging Face token from environment variable 
-HF_TOKEN = os.environ.get("HF_TOKEN", None)
+# Set up Hugging Face token from environment variable
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 # Load the model once at startup, outside of the handler
 print(f"Loading model: {MODEL_ID}")
-print(f"Default caption prompt: {CAPTION_PROMPT}")
 print(f"Default max tokens: {MAX_NEW_TOKENS}")
 
 # Configure token parameters if provided
@@ -52,9 +46,9 @@ try:
         quantization_config=quantization_config,
         **token_param,
     ).eval()
-    
+
     processor = AutoProcessor.from_pretrained(MODEL_ID, **token_param)
-    
+
     print(f"Model loaded on {device}")
 except Exception as e:
     if not HF_TOKEN:
@@ -63,20 +57,23 @@ except Exception as e:
 
 print("Model and processor loaded and ready for inference")
 
-def caption_image(image_data, prompt=CAPTION_PROMPT, max_new_tokens=MAX_NEW_TOKENS):
+
+def invoke(image_data=None, prompt='', max_new_tokens=MAX_NEW_TOKENS):
     """Generate a caption for the given image."""
     try:
         # Create messages for the model with custom prompt
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image", "image": image_data}
-                ]
-            }
-        ]
-        
+        if image_data:
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image", "image": image_data}
+            ]
+        else:
+            content = [
+                {"type": "text", "text": prompt}
+            ]
+
+        messages = [{"role": "user", "content": content}]
+
         # Process inputs
         inputs = processor.apply_chat_template(
             messages,
@@ -85,13 +82,13 @@ def caption_image(image_data, prompt=CAPTION_PROMPT, max_new_tokens=MAX_NEW_TOKE
             return_dict=True,
             return_tensors="pt"
         )
-        
+
         # Move inputs to device
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        
+
         # Track input length to extract only new tokens
         input_len = inputs["input_ids"].shape[-1]
-        
+
         # Generate caption
         with torch.inference_mode():
             outputs = model.generate(
@@ -99,24 +96,23 @@ def caption_image(image_data, prompt=CAPTION_PROMPT, max_new_tokens=MAX_NEW_TOKE
                 max_new_tokens=max_new_tokens,
                 do_sample=False
             )
-        
+
         # Extract only the newly generated tokens
         generated_tokens = outputs[0][input_len:]
-        
+
         # Decode the caption
-        caption = processor.decode(generated_tokens, skip_special_tokens=True)
-        
+        answer = processor.decode(generated_tokens, skip_special_tokens=True)
+
         # Ensure caption is a single line
-        caption = caption.replace('\n', ' ').strip()
-        return caption
-    
+        return answer.replace('\n', ' ').strip()
+
     except Exception as e:
         import traceback
         traceback_str = traceback.format_exc()
-        return f"Error processing image: {str(e)}\n{traceback_str}"
+        return f"Error: {str(e)}\n{traceback_str}"
 
 
-def handler(job):
+def handler(job: dict):
     """
     This is the handler function that will be called by the serverless worker.
     Job input format:
@@ -127,75 +123,64 @@ def handler(job):
     }
     """
     job_input = job["input"]
-    
-    # Basic input validation
-    if "image" not in job_input:
-        return {"error": "No image provided in input"}
-    
-    # Get the prompt (optional, use default if not provided)
-    prompt = job_input.get("prompt", CAPTION_PROMPT)
-    max_new_tokens = job_input.get("max_new_tokens", MAX_NEW_TOKENS)
-    
-    # Handle the image (base64, URL, or file path)
-    image_input = job_input["image"]
-    
-    try:
-        # Case 1: Base64 encoded image
-        if isinstance(image_input, str) and image_input.startswith("data:image"):
-            # Extract base64 part after the comma
-            base64_data = image_input.split(",")[1]
-            image_data = Image.open(io.BytesIO(base64.b64decode(base64_data)))
-        
-        # Case 2: Pure base64 string (without data URI prefix)
-        elif isinstance(image_input, str) and len(image_input) > 100:
-            try:
-                image_data = Image.open(io.BytesIO(base64.b64decode(image_input)))
-            except Exception:
-                # If not a valid base64, try as URL or file path
-                if image_input.startswith(('http://', 'https://')):
-                    # It's a URL, we need to download it
-                    import requests
-                    response = requests.get(image_input, stream=True)
-                    response.raise_for_status()  # Will raise an exception for HTTP errors
-                    image_data = Image.open(io.BytesIO(response.content))
-                else:
-                    # Assume it's a file path
-                    image_data = Image.open(image_input)
-        
-        # Case 3: URL starting with http:// or https://
-        elif isinstance(image_input, str) and image_input.startswith(('http://', 'https://')):
-            # It's a URL, we need to download it
-            import requests
-            response = requests.get(image_input, stream=True)
-            response.raise_for_status()  # Will raise an exception for HTTP errors
-            image_data = Image.open(io.BytesIO(response.content))
-        
-        # Case 4: Local file path
-        elif isinstance(image_input, str):
-            # Assume it's a file path
-            image_data = Image.open(image_input)
-        
-        else:
-            return {"error": "Invalid image format. Please provide a base64 encoded image, URL, or file path."}
-        
-        # Convert to RGB mode to ensure compatibility
-        image_data = image_data.convert("RGB")
-        
-        # Process the image to get the caption
-        caption = caption_image(image_data, prompt, max_new_tokens)
-        
-        # Return the result
-        return {
-            "caption": caption
-        }
-    
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        return {"error": f"Error processing image: {str(e)}", "traceback": error_trace}
 
+    # Get the prompt (optional, use default if not provided)
+    prompt = job_input["prompt"]
+    max_new_tokens = job_input.get("max_new_tokens", MAX_NEW_TOKENS)
+
+
+    if image_input := job_input.get("image"): # Handle the image (base64, URL, or file path)
+        try:
+            # Case 1: Base64 encoded image
+            if isinstance(image_input, str) and image_input.startswith("data:image"):
+                # Extract base64 part after the comma
+                base64_data = image_input.split(",")[1]
+                image_data = Image.open(io.BytesIO(base64.b64decode(base64_data)))
+
+            # Case 2: Pure base64 string (without data URI prefix)
+            elif isinstance(image_input, str) and len(image_input) > 100:
+                try:
+                    image_data = Image.open(io.BytesIO(base64.b64decode(image_input)))
+                except Exception:
+                    # If not a valid base64, try as URL or file path
+                    if image_input.startswith(('http://', 'https://')):
+                        # It's a URL, we need to download it
+                        import requests
+                        response = requests.get(image_input, stream=True)
+                        response.raise_for_status()  # Will raise an exception for HTTP errors
+                        image_data = Image.open(io.BytesIO(response.content))
+                    else:
+                        # Assume it's a file path
+                        image_data = Image.open(image_input)
+
+            # Case 3: URL starting with http:// or https://
+            elif isinstance(image_input, str) and image_input.startswith(('http://', 'https://')):
+                # It's a URL, we need to download it
+                import requests
+                response = requests.get(image_input, stream=True)
+                response.raise_for_status()  # Will raise an exception for HTTP errors
+                image_data = Image.open(io.BytesIO(response.content))
+
+            # Case 4: Local file path
+            elif isinstance(image_input, str):
+                # Assume it's a file path
+                image_data = Image.open(image_input)
+
+            else:
+                return {"error": "Invalid image format. Please provide a base64 encoded image, URL, or file path."}
+
+            # Convert to RGB mode to ensure compatibility
+            image_data = image_data.convert("RGB")
+
+            # Process the image to get the caption
+            return invoke(image_data, prompt, max_new_tokens)
+
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            return {"error": f"Error processing image: {str(e)}", "traceback": error_trace}
+    else:
+        return invoke(None, prompt, max_new_tokens) # Handle the text prompt
 
 # Start the serverless function
 runpod.serverless.start({"handler": handler})
-
-#test
